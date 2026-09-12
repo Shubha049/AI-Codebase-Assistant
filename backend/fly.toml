@@ -1,0 +1,31 @@
+app = "ai-codebase-assistant-api"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  ENVIRONMENT = "production"
+  EMBEDDING_PROVIDER = "openai"
+  EMBEDDING_MODEL = "text-embedding-3-small"
+  LLM_PROVIDER = "openai"
+  LLM_MODEL_NAME = "gpt-4o-mini"
+  PORT = "8000"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[http_service.checks]]
+  grace_period = "15s"
+  interval = "15s"
+  method = "GET"
+  path = "/health"
+  timeout = "5s"
+
+[mounts]
+  source = "aica_data"
+  destination = "/app/data"

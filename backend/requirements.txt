@@ -1,0 +1,56 @@
+# =============================================================================
+# AI Codebase Assistant — Backend dependencies
+# Phase 1: foundation (config, db, upload, extraction, scanning)
+# Python 3.11 - 3.13
+# =============================================================================
+
+# --- Core web framework ---
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+pydantic-settings==2.5.2
+python-dotenv==1.0.1
+python-multipart==0.0.9     # required for FastAPI file upload
+
+# --- Database ---
+sqlalchemy==2.0.35
+alembic==1.13.3
+
+# --- Testing ---
+pytest==8.3.3
+pytest-asyncio==0.24.0
+
+# --- Phase 3: parsing / AST extraction ---
+# tree-sitter-language-pack is actively maintained and ships prebuilt
+# wheels for Python 3.11-3.13 (unlike the abandoned tree-sitter-languages,
+# which was deliberately excluded in Phase 1 — see git history / original
+# README notes). One package, ~35 language grammars bundled.
+tree-sitter==0.26.0
+tree-sitter-language-pack==1.14.3
+httpx==0.27.2                # required by starlette's TestClient
+
+# --- Phase 4: embeddings & vector storage ---
+qdrant-client==1.11.2   # supports a real embedded mode (":memory:" or a
+                        # local path) — no server required for local dev
+tenacity==9.0.0         # retry/backoff for embedding batch calls
+
+# sentence-transformers (the "local" embedding provider) is INTENTIONALLY
+# NOT pinned here. It pulls in torch, which — via PyPI's default wheel —
+# also pulls ~2.7GB of NVIDIA CUDA packages regardless of whether a GPU is
+# present, and then requires downloading model weights from HuggingFace
+# Hub at runtime. Neither of those was possible in the sandbox this was
+# built in (disk space and network egress restrictions respectively — see
+# README "Known limitations" for the exact errors encountered). The
+# provider code in app/services/embeddings/providers/local_provider.py is
+# written against the real sentence-transformers API and will work as-is
+# once you add `sentence-transformers` to this file in an environment
+# with normal internet access. Uncomment to enable:
+# sentence-transformers==3.1.1
+
+# Phase 11 authentication & security
+email-validator==2.2.0
+slowapi==0.1.10
+
+# Production PostgreSQL driver
+psycopg[binary]==3.2.3
+

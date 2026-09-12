@@ -1,0 +1,294 @@
+# AI Codebase Assistant — Backend (Phase 3: Semantic Chunking & Indexing Foundation)
+
+## What this phase adds (Phases 1 and 2 unchanged in behavior)
+Turns each analyzed file into semantic chunks ready for embedding in
+Phase 4 — using real AST information from Phase 2 wherever available, an
+honest sliding-window fallback otherwise. Runs automatically, chained
+immediately after analysis (same background task, no new trigger needed).
+
+- **AST-aware chunking**: functions and classes-with-methods are split at
+  real symbol boundaries (class header separate from each method), not
+  arbitrary line counts. Regex-fallback-parsed files (Phase 2's 11
+  non-AST languages) get an honest sliding-window chunk instead, since
+  their symbol line-ranges aren't reliable enough for boundary-aware
+  splitting.
+- **Full file coverage**: imports and other code between/around symbols
+  become `module_level` chunks — nothing in an analyzed file is silently
+  excluded from the chunk set.
+- **Token-aware sizing** with a documented approximate estimator (~4
+  chars/token — no embedding provider is chosen yet, so there's no real
+  vocabulary to tokenize against).
+- **Overlapping sliding windows** for any single unit (function, method,
+  or fallback-parsed file) that exceeds the token budget.
+- **Duplicate detection**: exact (byte-for-byte) content-hash matching,
+  repo-wide, self-healing on every chunking run.
+- **Incremental indexing**: a file whose content hash hasn't changed since
+  its last chunking pass is skipped entirely — verified on a real running
+  server, not just in tests.
+
+## New endpoints
+- `GET /api/v1/repos/{id}/chunks` — list chunks, filterable by
+  `file_path`, `chunk_type`, `exclude_duplicates`
+- `GET /api/v1/repos/{id}/chunks/summary` — counts, type breakdown, job
+  status
+- `POST /api/v1/repos/{id}/chunks/regenerate?force=bool` — manually
+  re-trigger chunking; `force=false` (default) exercises incremental
+  indexing, `force=true` re-chunks everything
+
+`GET /api/v1/repos/{id}` now also returns `chunk_count`,
+`duplicate_chunk_count`, `chunked_file_count`.
+
+## Setup
+
+```bash
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+alembic upgrade head       # applies Phase 1, 2, and 3 migrations
+uvicorn app.main:app --reload --port 8000
+pytest -v
+```
+
+## Verify manually
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/v1/repos/upload -F "file=@yourrepo.zip"
+# poll until status is "chunked":
+curl http://127.0.0.1:8000/api/v1/repos/{id}
+curl http://127.0.0.1:8000/api/v1/repos/{id}/chunks/summary
+curl http://127.0.0.1:8000/api/v1/repos/{id}/chunks
+```
+
+## Verification actually performed
+
+- **105/105 automated tests pass** on a simulated fresh clone (new venv,
+  fresh install, migration, full `pytest` run) — 28 new this phase (9
+  symbol-chunker, 8 hashing/token-estimator, 11 end-to-end pipeline
+  integration tests), all prior-phase tests unmodified in behavior and
+  still passing (2 assertions updated from `"analyzed"` to `"chunked"`
+  since Phase 3 correctly advances status further — the underlying Phase
+  2 analysis output those tests check is untouched).
+- **Real HTTP verification against a live `uvicorn` server** (not just
+  `TestClient`, which runs background tasks synchronously and could mask
+  real-world timing issues): uploaded a real multi-language repo, polled
+  the chained analysis→chunking pipeline to actual completion, inspected
+  real chunk content/line numbers/hashes.
+- **Duplicate detection verified on the real server** with a repo
+  containing a genuine byte-for-byte duplicate function across two files
+  — correctly flagged one canonical + one duplicate chunk.
+- **Incremental indexing verified on the real server**: captured chunk
+  IDs, triggered `/regenerate?force=false`, confirmed chunk IDs were
+  completely unchanged (proof that unchanged files were skipped, not
+  silently re-chunked with new IDs) — then separately confirmed
+  `force=true` does produce new IDs while preserving the same logical
+  dedup outcome.
+- Migration verified against **both** a fresh DB and a DB with real
+  pre-existing Phase 1+2 data (same "NOT NULL column without a default"
+  issue as Phase 2's migration — caught the same way, by testing the raw
+  autogenerate output against a populated table before trusting it).
+
+## Bugs found and fixed this phase
+
+1. **Classes-with-methods that fit under the token budget were left as
+   ONE undifferentiated chunk**, silently contradicting the chunking
+   module's own documented design ("class with methods → header chunk +
+   one chunk per method," stated as unconditional). Only oversized
+   classes were actually being split. Found by inspecting real chunker
+   output on a small test class — the bug was inherited from code written
+   in an earlier, interrupted session and had not yet been exercised
+   end-to-end. Fixed, verified, regression-tested.
+2. Same autogenerated-migration NOT-NULL-without-default issue as Phase 2
+   (`chunk_count`, `duplicate_chunk_count`, `chunked_file_count` columns)
+   — caught before it could break an upgrade against a populated database,
+   fixed with `server_default`.
+3. Two bugs in my own test code (not the implementation) — a dict keyed
+   by `chunk_type` instead of `symbol_name`, and a Python-indentation
+   mistake in a test fixture that silently produced syntactically
+   different code than intended. Reporting these too, since distinguishing
+   "the code is wrong" from "my test is wrong" is exactly the kind of
+   claim that needs to be checked, not assumed.
+
+## Known limitations (explicit, not hidden)
+
+- **Token counts are approximate** (~4 chars/token heuristic), not a real
+  tokenizer — there's no embedding/LLM provider chosen yet (Phase 4) to
+  tokenize against correctly. Will over/under-count for dense symbols,
+  long identifiers, or non-Latin text.
+- **Duplicate detection is exact-match only.** Two near-identical chunks
+  (reformatted, renamed variables, trivially refactored) are NOT detected
+  as duplicates — this is a deliberate choice (byte-for-byte is safe and
+  unambiguous; fuzzy similarity is a much harder, higher-risk-of-false-
+  positive problem, appropriately deferred).
+- **Incremental indexing works at file granularity, not chunk
+  granularity** — if one line in a large file changes, the whole file's
+  chunks are regenerated (with new IDs), not just the affected chunk.
+- **No automatic re-chunk trigger on repository changes** — there's no
+  GitHub sync/re-upload flow yet (that's a later phase), so the manual
+  `/regenerate` endpoint is currently the only way to exercise incremental
+  indexing outside of the automatic post-upload run.
+- **Nested functions/classes are still not extracted** (inherited
+  limitation from Phase 2, unchanged) — chunking only sees what Phase 2's
+  parser extracted, so this limitation propagates forward.
+- **Docker not verified** — no daemon in my environment, same caveat as
+  Phases 1 and 2.
+
+---
+
+## Phase 4: Embeddings & Vector Database Integration
+
+### What this phase adds (Phases 1–3 unchanged in behavior)
+Turns Phase 3's chunks into a searchable vector index. Runs automatically,
+chained immediately after chunking. Provider-agnostic: switch between
+Sentence Transformers (local, free), OpenAI, Ollama, or a deterministic
+test-only mock — via config only, no code changes.
+
+### Environment constraints — read before trusting any "verified" claim below
+This was built in a sandbox with restricted network egress. Confirmed
+directly (not assumed):
+- `https://huggingface.co` → **HTTP 403** (blocked) — real
+  sentence-transformers model weights cannot be downloaded here.
+- `https://api.openai.com` → **HTTP 403** (blocked).
+- No Ollama binary installed, no server running.
+- `qdrant-client`'s embedded mode (`:memory:` or a local path) **works
+  fully** — a real mode the library ships, not a workaround.
+
+Given that, **only what's genuinely checkable was claimed as verified.**
+Real provider code was written for all three real providers and their
+request-building/response-parsing logic is unit-tested by mocking the
+HTTP layer — that proves our code is correct, not that the real services
+are reachable or behave as documented. See each provider's own module
+docstring for the exact command/error that confirms the block.
+
+### Embedding providers (config: `EMBEDDING_PROVIDER`)
+| Provider | Status | Notes |
+|---|---|---|
+| `mock` | **Fully verified**, real embedded Qdrant | Deterministic feature-hashing (real technique, not random) — meaningful cosine similarity, verified empirically. **Default** — matches this project's zero-setup philosophy, blocked from production by two independent guards. |
+| `local` (sentence-transformers) | Code correct, unverified end-to-end | Verified: graceful `EmbeddingError` when the package isn't installed, dimension lookup for known models without loading anything. NOT verified: actual model loading/inference (needs HuggingFace access). |
+| `openai` | Code correct, unverified end-to-end | Verified: exact request shape, response parsing (including reordering by `index`, not array position), every error path — all via mocked HTTP. NOT verified: a real API call (needs network + a valid key). |
+| `ollama` | Code correct, unverified end-to-end | Verified: exact request/response shape via mocked HTTP, connection-refused handling. NOT verified: a real Ollama server. |
+
+### New endpoints
+- `GET /api/v1/repos/{id}/embeddings/status` — provider, model, vector
+  count, job progress
+- `GET /api/v1/repos/{id}/embeddings/collection` — real Qdrant collection
+  info (points count, vector size, health)
+- `POST /api/v1/repos/{id}/embeddings/reindex?force=bool` — re-embed;
+  `force=false` skips already-embedded chunks (incremental), `force=true`
+  rebuilds everything
+- `DELETE /api/v1/repos/{id}/embeddings` — clears the repo's Qdrant
+  collection and resets embedding state
+- `POST /api/v1/repos/{id}/embeddings/search` — raw vector similarity
+  search (no LLM/answer synthesis — that's a later phase)
+
+### Setup
+
+```bash
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env       # EMBEDDING_PROVIDER=mock by default — works immediately
+alembic upgrade head        # applies all 4 phases' migrations
+uvicorn app.main:app --reload --port 8000
+pytest -v
+```
+
+To use real semantic embeddings instead of the mock:
+```bash
+# Local (free, needs ~2GB+ disk for torch, HuggingFace access to download the model):
+pip install sentence-transformers
+# then set EMBEDDING_PROVIDER=local in .env
+
+# OR OpenAI (needs an API key, small network calls, no local compute):
+# set EMBEDDING_PROVIDER=openai and OPENAI_API_KEY in .env
+
+# OR Ollama (free, local, needs the Ollama server running):
+# ollama pull nomic-embed-text
+# set EMBEDDING_PROVIDER=ollama in .env
+```
+
+### Verify manually
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/v1/repos/upload -F "file=@yourrepo.zip"
+# poll until status is "ready":
+curl http://127.0.0.1:8000/api/v1/repos/{id}
+curl http://127.0.0.1:8000/api/v1/repos/{id}/embeddings/status
+curl -X POST http://127.0.0.1:8000/api/v1/repos/{id}/embeddings/search \
+  -H "Content-Type: application/json" -d '{"query": "your search text", "top_k": 5}'
+```
+
+### Verification actually performed
+
+- **157/157 tests pass** on a fresh-clone simulation (52 new this phase).
+- **Fixed a real onboarding regression before it shipped**: the initial
+  `.env.example` defaulted to `EMBEDDING_PROVIDER=local`, which requires
+  `sentence-transformers` (not installed by design). A fresh clone
+  following the README's exact steps produced a repository stuck in
+  `status: "failed"` — confirmed directly by running exactly those steps.
+  Changed the default to `mock` (matching `config.py`'s own Python-level
+  default) and re-verified: a completely fresh clone now reaches
+  `status: "ready"` with working search, zero manual configuration.
+- **Full real end-to-end run against a live `uvicorn` server**: upload →
+  poll to `"ready"` → embedding status → collection info → search
+  (correct top result) → delete vectors (collection genuinely gone
+  afterward) — every step against real HTTP, real Qdrant embedded
+  storage, not `TestClient` shortcuts.
+- **Qdrant wrapper verified directly** against real embedded-mode
+  behavior: collection lifecycle, upsert/search/delete, pagination beyond
+  the default 1000-point scroll page (1500 points inserted, all 1500
+  returned), and graceful no-ops on a nonexistent collection.
+- **Retry logic verified with a controlled flaky provider**: confirmed
+  exact retry counts on both eventual-success and exhausted-retries paths.
+- **Duplicate-chunk vector handling verified end-to-end**: a duplicate
+  chunk gets its own real, independently-searchable Qdrant point (reusing
+  its canonical's vector rather than re-embedding identical content) —
+  regression test for a bug an earlier interrupted session had already
+  found and fixed (duplicates were previously excluded from Qdrant
+  entirely, contradicting the pipeline's own docstring).
+- **Orphaned-vector cleanup verified end-to-end**: forced a chunk
+  regeneration (new chunk IDs per Phase 3), re-embedded, and confirmed
+  the OLD chunk IDs' vectors were actually gone from Qdrant, not leaked.
+- Migration verified against both a fresh DB and one with real
+  pre-existing Phase 1–3 data.
+
+### Real bugs found and fixed this phase
+
+1. **Onboarding regression** (above) — `.env.example` defaulted to a
+   provider requiring an uninstalled dependency, breaking the zero-setup
+   promise every prior phase's README established. Found by actually
+   running the documented setup steps, not by inspection.
+2. **N+1 database query in the search endpoint** — content for each
+   search hit was fetched with a separate query inside a list
+   comprehension. Fixed to a single batched `IN` query.
+3. *(Inherited from an earlier interrupted session, already fixed before
+   this review but worth recording for the full picture):* duplicate
+   chunks were previously excluded from Qdrant entirely, contradicting
+   the pipeline's own documented behavior — found by tracing actual query
+   filters against the doc comment rather than trusting well-written
+   prose.
+
+### Known limitations (explicit, not hidden)
+
+- **Real semantic embedding quality is unverified in this environment.**
+  The mock provider proves the pipeline mechanics are correct; it proves
+  nothing about how well real embeddings will perform. Run with `local`,
+  `openai`, or `ollama` in an environment with the relevant access to
+  validate actual search quality.
+- **`vectors_count` in Qdrant's collection info is `None`** — a real,
+  upstream characteristic of the qdrant-client version pinned here (the
+  field is deprecated in favor of `points_count`, which is populated
+  correctly), not a bug in this codebase.
+- **Incremental indexing is per-chunk** (via `embedded_at`/
+  `embedding_model` comparison), not per-batch — a large repo's first
+  index still processes everything in one background run; there's no
+  pause/resume across process restarts mid-run.
+- **No embedding-provider fallback/failover** — if the configured
+  provider fails permanently for a batch, those chunks are recorded as
+  failed and skipped; there's no automatic fallback to a different
+  provider.
+- **OpenAI/Ollama rate-limit handling is generic** (the same
+  retry/backoff as any other transient failure), not rate-limit-header-aware.
+- **Docker not verified** — no daemon in my environment, same caveat as
+  every prior phase. `QDRANT_URL` pointed at a real server (vs. embedded
+  mode) is written to work but genuinely untested here.
+
+

@@ -1,0 +1,44 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: aica
+      POSTGRES_USER: aica
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes: ["postgres_data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aica -d aica"]
+
+  qdrant:
+    image: qdrant/qdrant:v1.11.5
+    restart: unless-stopped
+    volumes: ["qdrant_data:/qdrant/storage"]
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    env_file: [./backend/.env]
+    environment:
+      ENVIRONMENT: production
+      DEBUG: "false"
+      DATABASE_URL: postgresql+psycopg://aica:${POSTGRES_PASSWORD}@postgres:5432/aica
+      QDRANT_URL: http://qdrant:6333
+    ports: ["127.0.0.1:8000:8000"]
+    volumes: ["backend_data:/app/data"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    ports: ["127.0.0.1:5173:80"]
+    depends_on: [backend]
+
+volumes:
+  postgres_data:
+  qdrant_data:
+  backend_data:

@@ -1,0 +1,48 @@
+services:
+  # 1. FastAPI Backend Web Service
+  - type: web
+    name: aica-backend
+    env: docker
+    dockerfilePath: backend/Dockerfile
+    dockerContext: backend
+    plan: standard
+    healthCheckPath: /health
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: aica-postgres
+          property: connectionString
+      - key: AUTH_SECRET_KEY
+        generateValue: true
+      - key: EMBEDDING_PROVIDER
+        value: openai
+      - key: EMBEDDING_MODEL
+        value: text-embedding-3-small
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: LLM_PROVIDER
+        value: openai
+      - key: LLM_MODEL_NAME
+        value: gpt-4o-mini
+      - key: QDRANT_URL
+        value: http://aica-qdrant:6333
+
+  # 2. Standalone Qdrant Vector Service
+  - type: pserv
+    name: aica-qdrant
+    env: docker
+    image: qdrant/qdrant:v1.11.5
+    plan: standard
+    disk:
+      name: qdrant-data
+      mountPath: /qdrant/storage
+      sizeGB: 10
+
+databases:
+  # 3. Managed PostgreSQL Database
+  - name: aica-postgres
+    plan: free
+    databaseName: aica
+    user: aica
